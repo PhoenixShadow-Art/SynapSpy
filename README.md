@@ -22,18 +22,16 @@ SynapSpy is a Roblox RemoteSpy-style **executor script** made for monitoring, in
 
 This script is designed to be used with an executor.
 
-Replace `RAW_URL` with your GitHub raw file link:
+Copy loadstring and Execute in Game:
 
 ```lua
-loadstring(game:HttpGet("RAW_URL"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/PhoenixShadow-Art/SynapSpy/refs/heads/main/SynapSpy"))()
 ```
 
 ## Installation
 
-1. Upload the main script to your GitHub repository.
-2. Copy the raw link for the script.
-3. Replace `RAW_URL` in the loadstring above with your raw GitHub link.
-4. Execute the script in your executor.
+1. Copy the loadString  for the script.
+2. Execute the script in your executor.
 
 ## Notes
 
