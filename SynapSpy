@@ -1,0 +1,1274 @@
+--[[
+    RemoteSpy Pro v1.0
+    A professional Remote Event/Function spy for Roblox developers.
+    Place in a LocalScript inside StarterPlayerScripts or StarterGui.
+    
+    Features:
+    - Detects all RemoteEvents and RemoteFunctions
+    - Real-time logging with timestamps
+    - Fire/Invoke with argument support
+    - Block/Unblock remotes
+    - Search and filter
+    - Mobile + PC responsive UI
+    - Draggable window
+    - Metatable hooking for passive monitoring
+--]]
+
+-- ============================================================
+-- SERVICES
+-- ============================================================
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ============================================================
+-- CONSTANTS & CONFIG
+-- ============================================================
+local VERSION = "v1.0"
+
+local THEME = {
+    BG_DARK       = Color3.fromRGB(15,  15,  20),
+    BG_MID        = Color3.fromRGB(22,  22,  32),
+    BG_PANEL      = Color3.fromRGB(28,  28,  42),
+    BG_ITEM       = Color3.fromRGB(35,  35,  52),
+    BG_ITEM_HOVER = Color3.fromRGB(45,  45,  68),
+    ACCENT        = Color3.fromRGB(88,  101, 242),
+    ACCENT2       = Color3.fromRGB(139, 92,  246),
+    SUCCESS       = Color3.fromRGB(59,  165, 93),
+    WARNING       = Color3.fromRGB(250, 166, 26),
+    DANGER        = Color3.fromRGB(237, 66,  69),
+    TEXT_PRIMARY  = Color3.fromRGB(255, 255, 255),
+    TEXT_SECONDARY= Color3.fromRGB(180, 180, 200),
+    TEXT_MUTED    = Color3.fromRGB(120, 120, 145),
+    BORDER        = Color3.fromRGB(55,  55,  80),
+    LOG_EVENT     = Color3.fromRGB(88,  101, 242),
+    LOG_FUNC      = Color3.fromRGB(139, 92,  246),
+    LOG_BLOCKED   = Color3.fromRGB(237, 66,  69),
+}
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local State = {
+    remotes        = {},    -- [remote] = remoteData
+    logEntries     = {},    -- array of log entries
+    spyEnabled     = true,
+    autoScroll     = true,
+    filterType     = "All", -- "All" | "RemoteEvent" | "RemoteFunction"
+    searchQuery    = "",
+    selectedRemote = nil,
+    minimized      = false,
+    connections    = {},    -- cleanup
+}
+
+-- ============================================================
+-- UTILITY FUNCTIONS
+-- ============================================================
+local function getFullPath(obj)
+    if not obj then return "nil" end
+    local path = obj.Name
+    local parent = obj.Parent
+    while parent and parent ~= game do
+        path = parent.Name .. "." .. path
+        parent = parent.Parent
+    end
+    return "game." .. path
+end
+
+local function formatTime()
+    local t = os.time()
+    return os.date("%H:%M:%S", t)
+end
+
+local function formatArgs(args)
+    local parts = {}
+    for i, v in ipairs(args) do
+        local t = typeof(v)
+        if t == "string" then
+            parts[i] = string.format('"%s"', tostring(v):sub(1, 40))
+        elseif t == "Instance" then
+            parts[i] = string.format('[Instance] %s', v:GetFullName())
+        elseif t == "table" then
+            parts[i] = "[table]"
+        elseif t == "Vector3" then
+            parts[i] = string.format("Vector3(%g,%g,%g)", v.X, v.Y, v.Z)
+        elseif t == "CFrame" then
+            parts[i] = string.format("CFrame(%g,%g,%g)", v.X, v.Y, v.Z)
+        elseif t == "Color3" then
+            parts[i] = string.format("Color3(%d,%d,%d)",
+                math.floor(v.R*255), math.floor(v.G*255), math.floor(v.B*255))
+        else
+            parts[i] = tostring(v)
+        end
+    end
+    return table.concat(parts, ", ")
+end
+
+-- Parse a simple argument string into a Lua value
+local function parseArg(str)
+    str = str:match("^%s*(.-)%s*$") -- trim
+    if str == "true"  then return true  end
+    if str == "false" then return false end
+    if str == "nil"   then return nil   end
+    -- number
+    local n = tonumber(str)
+    if n then return n end
+    -- Vector3
+    local x,y,z = str:match("^Vector3%(([%d%.%-]+),([%d%.%-]+),([%d%.%-]+)%)$")
+    if x then return Vector3.new(tonumber(x), tonumber(y), tonumber(z)) end
+    -- Color3
+    local r,g,b = str:match("^Color3%(([%d%.%-]+),([%d%.%-]+),([%d%.%-]+)%)$")
+    if r then return Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b)) end
+    -- Instance path
+    if str:sub(1,5) == "game." then
+        local ok, inst = pcall(function()
+            local parts = str:sub(6):split(".")
+            local obj = game
+            for _, p in ipairs(parts) do obj = obj[p] end
+            return obj
+        end)
+        if ok then return inst end
+    end
+    -- default: string (strip quotes if present)
+    return str:match('^"(.*)"$') or str:match("^'(.*)'$") or str
+end
+
+local function parseArgs(argString)
+    local args = {}
+    -- Simple split by comma (not inside brackets)
+    local depth = 0
+    local current = ""
+    for i = 1, #argString do
+        local c = argString:sub(i,i)
+        if c == "(" or c == "{" or c == "[" then depth = depth + 1
+        elseif c == ")" or c == "}" or c == "]" then depth = depth - 1
+        end
+        if c == "," and depth == 0 then
+            local v = parseArg(current)
+            if v ~= nil then table.insert(args, v) end
+            current = ""
+        else
+            current = current .. c
+        end
+    end
+    if current:match("%S") then
+        local v = parseArg(current)
+        if v ~= nil then table.insert(args, v) end
+    end
+    return args
+end
+
+local function isMobile()
+    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+end
+
+-- ============================================================
+-- UI BUILDER HELPERS
+-- ============================================================
+local function makeInstance(cls, props, parent)
+    local inst = Instance.new(cls)
+    for k, v in pairs(props) do
+        inst[k] = v
+    end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+local function addCorner(parent, radius)
+    return makeInstance("UICorner", {CornerRadius = UDim.new(0, radius or 8)}, parent)
+end
+
+local function addStroke(parent, color, thickness)
+    return makeInstance("UIStroke", {
+        Color = color or THEME.BORDER,
+        Thickness = thickness or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, parent)
+end
+
+local function addPadding(parent, top, bottom, left, right)
+    return makeInstance("UIPadding", {
+        PaddingTop    = UDim.new(0, top    or 6),
+        PaddingBottom = UDim.new(0, bottom or 6),
+        PaddingLeft   = UDim.new(0, left   or 6),
+        PaddingRight  = UDim.new(0, right  or 6),
+    }, parent)
+end
+
+local function makeLabelButton(text, color, parent)
+    local btn = makeInstance("TextButton", {
+        Text              = text,
+        TextColor3        = THEME.TEXT_PRIMARY,
+        BackgroundColor3  = color or THEME.ACCENT,
+        Font              = Enum.Font.GothamBold,
+        TextSize          = 11,
+        AutoButtonColor   = false,
+        Size              = UDim2.new(0, 80, 0, 26),
+        BorderSizePixel   = 0,
+    }, parent)
+    addCorner(btn, 6)
+    -- Hover effect
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.15), {
+            BackgroundColor3 = color and color:Lerp(Color3.new(1,1,1), 0.15) or THEME.ACCENT:Lerp(Color3.new(1,1,1), 0.15)
+        }):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.15), {
+            BackgroundColor3 = color or THEME.ACCENT
+        }):Play()
+    end)
+    return btn
+end
+
+-- ============================================================
+-- MAIN SCREEN GUI
+-- ============================================================
+local ScreenGui = makeInstance("ScreenGui", {
+    Name               = "RemoteSpyPro",
+    ResetOnSpawn       = false,
+    ZIndexBehavior     = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder       = 999,
+    IgnoreGuiInset     = true,
+}, PlayerGui)
+
+-- ============================================================
+-- MAIN WINDOW
+-- ============================================================
+local mobile = isMobile()
+
+local WIN_W = mobile and 370 or 720
+local WIN_H = mobile and 520 or 540
+
+local MainWindow = makeInstance("Frame", {
+    Name             = "MainWindow",
+    Size             = UDim2.new(0, WIN_W, 0, WIN_H),
+    Position         = UDim2.new(0.5, -WIN_W/2, 0.5, -WIN_H/2),
+    BackgroundColor3 = THEME.BG_DARK,
+    BorderSizePixel  = 0,
+    ClipsDescendants = true,
+}, ScreenGui)
+addCorner(MainWindow, 12)
+addStroke(MainWindow, THEME.BORDER, 1.5)
+
+-- Gradient top accent line
+local accentLine = makeInstance("Frame", {
+    Size             = UDim2.new(1, 0, 0, 2),
+    Position         = UDim2.new(0, 0, 0, 0),
+    BackgroundColor3 = THEME.ACCENT,
+    BorderSizePixel  = 0,
+    ZIndex           = 10,
+}, MainWindow)
+makeInstance("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0,   THEME.ACCENT),
+        ColorSequenceKeypoint.new(0.5, THEME.ACCENT2),
+        ColorSequenceKeypoint.new(1,   THEME.ACCENT),
+    }),
+    Rotation = 0,
+}, accentLine)
+
+-- ============================================================
+-- TITLE BAR
+-- ============================================================
+local TitleBar = makeInstance("Frame", {
+    Name             = "TitleBar",
+    Size             = UDim2.new(1, 0, 0, 38),
+    Position         = UDim2.new(0, 0, 0, 2),
+    BackgroundColor3 = THEME.BG_MID,
+    BorderSizePixel  = 0,
+}, MainWindow)
+
+local TitleLabel = makeInstance("TextLabel", {
+    Text             = "🔍 Remote Spy Pro " .. VERSION,
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundTransparency = 1,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 14,
+    Size             = UDim2.new(1, -110, 1, 0),
+    Position         = UDim2.new(0, 12, 0, 0),
+    TextXAlignment   = Enum.TextXAlignment.Left,
+}, TitleBar)
+
+-- Window control buttons
+local function makeTitleBtn(text, color, xOffset)
+    local btn = makeInstance("TextButton", {
+        Text             = text,
+        TextColor3       = THEME.TEXT_PRIMARY,
+        BackgroundColor3 = color,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 11,
+        Size             = UDim2.new(0, 26, 0, 22),
+        Position         = UDim2.new(1, xOffset, 0.5, -11),
+        BorderSizePixel  = 0,
+        AutoButtonColor  = false,
+    }, TitleBar)
+    addCorner(btn, 6)
+    return btn
+end
+
+local CloseBtn    = makeTitleBtn("✕", THEME.DANGER,   -8)
+local MinMaxBtn   = makeTitleBtn("–", THEME.WARNING,  -38)
+local SpyToggleBtn= makeTitleBtn("ON", THEME.SUCCESS, -72)
+
+-- Dragging logic
+local dragging, dragStart, startPos
+TitleBar.InputBegan:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1
+    or inp.UserInputType == Enum.UserInputType.Touch then
+        dragging  = true
+        dragStart = inp.Position
+        startPos  = MainWindow.Position
+    end
+end)
+TitleBar.InputChanged:Connect(function(inp)
+    if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement
+    or inp.UserInputType == Enum.UserInputType.Touch) then
+        local delta = inp.Position - dragStart
+        MainWindow.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+TitleBar.InputEnded:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1
+    or inp.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+-- ============================================================
+-- CONTENT AREA (below title bar)
+-- ============================================================
+local ContentFrame = makeInstance("Frame", {
+    Name             = "ContentFrame",
+    Size             = UDim2.new(1, 0, 1, -40),
+    Position         = UDim2.new(0, 0, 0, 40),
+    BackgroundTransparency = 1,
+    BorderSizePixel  = 0,
+}, MainWindow)
+
+-- ============================================================
+-- TOP TOOLBAR (search, filter, refresh)
+-- ============================================================
+local Toolbar = makeInstance("Frame", {
+    Name             = "Toolbar",
+    Size             = UDim2.new(1, 0, 0, 36),
+    BackgroundColor3 = THEME.BG_MID,
+    BorderSizePixel  = 0,
+}, ContentFrame)
+
+addPadding(Toolbar, 5, 5, 8, 8)
+
+local ToolbarLayout = makeInstance("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding       = UDim.new(0, 6),
+    VerticalAlignment = Enum.VerticalAlignment.Center,
+}, Toolbar)
+
+-- Search bar
+local SearchBox = makeInstance("TextBox", {
+    PlaceholderText  = "🔎 Search remotes...",
+    PlaceholderColor3= THEME.TEXT_MUTED,
+    Text             = "",
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundColor3 = THEME.BG_ITEM,
+    Font             = Enum.Font.Gotham,
+    TextSize         = 12,
+    ClearTextOnFocus = false,
+    Size             = UDim2.new(0, mobile and 130 or 200, 0, 26),
+    BorderSizePixel  = 0,
+    TextXAlignment   = Enum.TextXAlignment.Left,
+}, Toolbar)
+addCorner(SearchBox, 6)
+addStroke(SearchBox, THEME.BORDER)
+addPadding(SearchBox, 0, 0, 8, 8)
+
+-- Filter buttons
+local function makeFilterBtn(label)
+    local btn = makeInstance("TextButton", {
+        Text             = label,
+        TextColor3       = THEME.TEXT_SECONDARY,
+        BackgroundColor3 = THEME.BG_ITEM,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 11,
+        AutoButtonColor  = false,
+        Size             = UDim2.new(0, mobile and 44 or 80, 0, 26),
+        BorderSizePixel  = 0,
+    }, Toolbar)
+    addCorner(btn, 6)
+    return btn
+end
+
+local FilterAll     = makeFilterBtn("All")
+local FilterEvents  = makeFilterBtn(mobile and "Evt" or "Events")
+local FilterFuncs   = makeFilterBtn(mobile and "Fn"  or "Functions")
+
+-- Refresh button
+local RefreshBtn = makeInstance("TextButton", {
+    Text             = "↻",
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundColor3 = THEME.ACCENT,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 16,
+    AutoButtonColor  = false,
+    Size             = UDim2.new(0, 30, 0, 26),
+    BorderSizePixel  = 0,
+}, Toolbar)
+addCorner(RefreshBtn, 6)
+
+-- Clear log button
+local ClearLogBtn = makeInstance("TextButton", {
+    Text             = "🗑",
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundColor3 = THEME.DANGER,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 14,
+    AutoButtonColor  = false,
+    Size             = UDim2.new(0, 30, 0, 26),
+    BorderSizePixel  = 0,
+}, Toolbar)
+addCorner(ClearLogBtn, 6)
+
+-- Auto-scroll toggle
+local AutoScrollBtn = makeInstance("TextButton", {
+    Text             = "⬇",
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundColor3 = THEME.SUCCESS,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 13,
+    AutoButtonColor  = false,
+    Size             = UDim2.new(0, 30, 0, 26),
+    BorderSizePixel  = 0,
+}, Toolbar)
+addCorner(AutoScrollBtn, 6)
+
+-- ============================================================
+-- SPLIT VIEW: Remote List (left) | Log (right)
+-- ============================================================
+local SplitFrame = makeInstance("Frame", {
+    Name             = "SplitFrame",
+    Size             = UDim2.new(1, 0, 1, -36),
+    Position         = UDim2.new(0, 0, 0, 36),
+    BackgroundTransparency = 1,
+}, ContentFrame)
+
+-- If mobile, stack vertically; otherwise side-by-side
+local listW = mobile and 1.0 or 0.42
+local logW  = mobile and 1.0 or 0.58
+local listH = mobile and 0.48 or 1.0
+local logH  = mobile and 0.52 or 1.0
+local logY  = mobile and 0.48 or 0.0
+local logX  = mobile and 0.0  or 0.42
+
+-- ============================================================
+-- REMOTE LIST PANEL
+-- ============================================================
+local ListPanel = makeInstance("Frame", {
+    Name             = "ListPanel",
+    Size             = UDim2.new(listW, mobile and 0 or -1, listH, 0),
+    Position         = UDim2.new(0, 0, 0, 0),
+    BackgroundColor3 = THEME.BG_PANEL,
+    BorderSizePixel  = 0,
+}, SplitFrame)
+
+local ListHeader = makeInstance("TextLabel", {
+    Text             = "REMOTES (0)",
+    TextColor3       = THEME.TEXT_MUTED,
+    BackgroundTransparency = 1,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 10,
+    Size             = UDim2.new(1, 0, 0, 20),
+    TextXAlignment   = Enum.TextXAlignment.Left,
+}, ListPanel)
+addPadding(ListHeader, 4, 0, 8, 0)
+
+local RemoteScroll = makeInstance("ScrollingFrame", {
+    Name             = "RemoteScroll",
+    Size             = UDim2.new(1, 0, 1, -20),
+    Position         = UDim2.new(0, 0, 0, 20),
+    BackgroundTransparency = 1,
+    BorderSizePixel  = 0,
+    ScrollBarThickness = 4,
+    ScrollBarImageColor3 = THEME.ACCENT,
+    CanvasSize       = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, ListPanel)
+
+local RemoteListLayout = makeInstance("UIListLayout", {
+    Padding      = UDim.new(0, 2),
+    SortOrder    = Enum.SortOrder.Name,
+}, RemoteScroll)
+addPadding(RemoteScroll, 2, 4, 4, 4)
+
+-- ============================================================
+-- LOG PANEL
+-- ============================================================
+local LogPanel = makeInstance("Frame", {
+    Name             = "LogPanel",
+    Size             = UDim2.new(logW, 0, logH, 0),
+    Position         = UDim2.new(logX, mobile and 0 or 2, logY, 0),
+    BackgroundColor3 = THEME.BG_PANEL,
+    BorderSizePixel  = 0,
+}, SplitFrame)
+
+local LogHeader = makeInstance("TextLabel", {
+    Text             = "ACTIVITY LOG",
+    TextColor3       = THEME.TEXT_MUTED,
+    BackgroundTransparency = 1,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 10,
+    Size             = UDim2.new(1, 0, 0, 20),
+    TextXAlignment   = Enum.TextXAlignment.Left,
+}, LogPanel)
+addPadding(LogHeader, 4, 0, 8, 0)
+
+local LogScroll = makeInstance("ScrollingFrame", {
+    Name             = "LogScroll",
+    Size             = UDim2.new(1, 0, 1, -20),
+    Position         = UDim2.new(0, 0, 0, 20),
+    BackgroundTransparency = 1,
+    BorderSizePixel  = 0,
+    ScrollBarThickness = 4,
+    ScrollBarImageColor3 = THEME.ACCENT2,
+    CanvasSize       = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, LogPanel)
+
+local LogListLayout = makeInstance("UIListLayout", {
+    Padding   = UDim.new(0, 2),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, LogScroll)
+addPadding(LogScroll, 2, 4, 4, 4)
+
+-- ============================================================
+-- FIRE ARGUMENT POPUP
+-- ============================================================
+local FirePopup = makeInstance("Frame", {
+    Name             = "FirePopup",
+    Size             = UDim2.new(0, 320, 0, 240),
+    Position         = UDim2.new(0.5, -160, 0.5, -120),
+    BackgroundColor3 = THEME.BG_MID,
+    BorderSizePixel  = 0,
+    Visible          = false,
+    ZIndex           = 20,
+}, MainWindow)
+addCorner(FirePopup, 10)
+addStroke(FirePopup, THEME.ACCENT, 1.5)
+
+local PopupTitle = makeInstance("TextLabel", {
+    Text             = "Fire Remote",
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundTransparency = 1,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 13,
+    Size             = UDim2.new(1, -40, 0, 32),
+    Position         = UDim2.new(0, 12, 0, 0),
+    TextXAlignment   = Enum.TextXAlignment.Left,
+    ZIndex           = 21,
+}, FirePopup)
+
+local PopupClose = makeInstance("TextButton", {
+    Text             = "✕",
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundColor3 = THEME.DANGER,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 11,
+    Size             = UDim2.new(0, 24, 0, 24),
+    Position         = UDim2.new(1, -30, 0, 4),
+    BorderSizePixel  = 0,
+    AutoButtonColor  = false,
+    ZIndex           = 22,
+}, FirePopup)
+addCorner(PopupClose, 6)
+
+local PopupArgLabel = makeInstance("TextLabel", {
+    Text             = "Arguments (comma-separated):",
+    TextColor3       = THEME.TEXT_SECONDARY,
+    BackgroundTransparency = 1,
+    Font             = Enum.Font.Gotham,
+    TextSize         = 11,
+    Size             = UDim2.new(1, -16, 0, 18),
+    Position         = UDim2.new(0, 8, 0, 34),
+    TextXAlignment   = Enum.TextXAlignment.Left,
+    ZIndex           = 21,
+}, FirePopup)
+
+local PopupArgHint = makeInstance("TextLabel", {
+    Text             = 'e.g. "hello", 42, true, Vector3(0,1,0)',
+    TextColor3       = THEME.TEXT_MUTED,
+    BackgroundTransparency = 1,
+    Font             = Enum.Font.Gotham,
+    TextSize         = 9,
+    Size             = UDim2.new(1, -16, 0, 14),
+    Position         = UDim2.new(0, 8, 0, 52),
+    TextXAlignment   = Enum.TextXAlignment.Left,
+    ZIndex           = 21,
+}, FirePopup)
+
+local PopupArgBox = makeInstance("TextBox", {
+    Text             = "",
+    PlaceholderText  = 'Args here...',
+    PlaceholderColor3= THEME.TEXT_MUTED,
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundColor3 = THEME.BG_ITEM,
+    Font             = Enum.Font.Code,
+    TextSize         = 11,
+    ClearTextOnFocus = false,
+    MultiLine        = true,
+    TextWrapped      = true,
+    TextXAlignment   = Enum.TextXAlignment.Left,
+    TextYAlignment   = Enum.TextYAlignment.Top,
+    Size             = UDim2.new(1, -16, 0, 80),
+    Position         = UDim2.new(0, 8, 0, 68),
+    BorderSizePixel  = 0,
+    ZIndex           = 21,
+}, FirePopup)
+addCorner(PopupArgBox, 6)
+addStroke(PopupArgBox, THEME.BORDER)
+addPadding(PopupArgBox, 4, 4, 6, 6)
+
+local PopupFireBtn = makeInstance("TextButton", {
+    Text             = "⚡ Fire / Invoke",
+    TextColor3       = THEME.TEXT_PRIMARY,
+    BackgroundColor3 = THEME.ACCENT,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 12,
+    AutoButtonColor  = false,
+    Size             = UDim2.new(1, -16, 0, 32),
+    Position         = UDim2.new(0, 8, 0, 156),
+    BorderSizePixel  = 0,
+    ZIndex           = 21,
+}, FirePopup)
+addCorner(PopupFireBtn, 8)
+
+local PopupResultLabel = makeInstance("TextLabel", {
+    Text             = "",
+    TextColor3       = THEME.SUCCESS,
+    BackgroundTransparency = 1,
+    Font             = Enum.Font.Gotham,
+    TextSize         = 10,
+    Size             = UDim2.new(1, -16, 0, 28),
+    Position         = UDim2.new(0, 8, 0, 194),
+    TextXAlignment   = Enum.TextXAlignment.Left,
+    TextWrapped      = true,
+    ZIndex           = 21,
+}, FirePopup)
+
+local activeFireTarget = nil -- the remote currently targeted by popup
+
+-- ============================================================
+-- REMOTE DATA & HOOKING ENGINE
+-- ============================================================
+-- We hook FireServer / InvokeServer via metatable to passively log calls.
+local hookedMeta = {}
+
+local originalFireServer   = nil
+local originalInvokeServer = nil
+
+local function hookRemoteMethods()
+    -- Hook RemoteEvent:FireServer
+    local reMeta = getmetatable(Instance.new("RemoteEvent"))
+    if reMeta then
+        originalFireServer = reMeta.__index.FireServer
+        reMeta.__index.FireServer = function(self, ...)
+            local args = {...}
+            if State.spyEnabled then
+                local rd = State.remotes[self]
+                if rd then
+                    if rd.blocked then return end -- block if flagged
+                    rd.fireCount = rd.fireCount + 1
+                    rd.lastFired = formatTime()
+                    addLogEntry(self, "Fired", args)
+                    -- refresh UI row
+                    updateRemoteRow(self)
+                end
+            end
+            return originalFireServer(self, table.unpack(args))
+        end
+        hookedMeta.re = true
+    end
+
+    -- Hook RemoteFunction:InvokeServer
+    local rfMeta = getmetatable(Instance.new("RemoteFunction"))
+    if rfMeta then
+        originalInvokeServer = rfMeta.__index.InvokeServer
+        rfMeta.__index.InvokeServer = function(self, ...)
+            local args = {...}
+            if State.spyEnabled then
+                local rd = State.remotes[self]
+                if rd then
+                    if rd.blocked then return nil end
+                    rd.fireCount = rd.fireCount + 1
+                    rd.lastFired = formatTime()
+                    addLogEntry(self, "Invoked", args)
+                    updateRemoteRow(self)
+                end
+            end
+            return originalInvokeServer(self, table.unpack(args))
+        end
+        hookedMeta.rf = true
+    end
+end
+
+-- ============================================================
+-- LOG ENTRY CREATION
+-- ============================================================
+local logIndex = 0
+
+function addLogEntry(remote, action, args)
+    logIndex = logIndex + 1
+    local rd = State.remotes[remote]
+    local name = remote and remote.Name or "?"
+    local rtype = rd and rd.remoteType or "?"
+    local color = (rtype == "RemoteEvent") and THEME.LOG_EVENT or THEME.LOG_FUNC
+    if rd and rd.blocked then color = THEME.LOG_BLOCKED end
+
+    local entry = makeInstance("Frame", {
+        Name             = "LogEntry_" .. logIndex,
+        Size             = UDim2.new(1, -8, 0, 42),
+        BackgroundColor3 = THEME.BG_ITEM,
+        BorderSizePixel  = 0,
+        LayoutOrder      = logIndex,
+        ZIndex           = 2,
+    }, LogScroll)
+    addCorner(entry, 6)
+
+    -- Color strip on left
+    makeInstance("Frame", {
+        Size             = UDim2.new(0, 3, 1, -8),
+        Position         = UDim2.new(0, 0, 0, 4),
+        BackgroundColor3 = color,
+        BorderSizePixel  = 0,
+        ZIndex           = 3,
+    }, entry)
+    addCorner(entry:FindFirstChild("Frame") or entry, 2)
+
+    makeInstance("TextLabel", {
+        Text             = string.format("[%s] %s → %s", formatTime(), name, action),
+        TextColor3       = THEME.TEXT_PRIMARY,
+        BackgroundTransparency = 1,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 11,
+        Size             = UDim2.new(1, -12, 0, 18),
+        Position         = UDim2.new(0, 10, 0, 3),
+        TextXAlignment   = Enum.TextXAlignment.Left,
+        TextTruncate     = Enum.TextTruncate.AtEnd,
+        ZIndex           = 3,
+    }, entry)
+
+    local argsStr = formatArgs(args)
+    if #argsStr == 0 then argsStr = "(no args)" end
+    makeInstance("TextLabel", {
+        Text             = argsStr,
+        TextColor3       = THEME.TEXT_MUTED,
+        BackgroundTransparency = 1,
+        Font             = Enum.Font.Code,
+        TextSize         = 9,
+        Size             = UDim2.new(1, -12, 0, 16),
+        Position         = UDim2.new(0, 10, 0, 22),
+        TextXAlignment   = Enum.TextXAlignment.Left,
+        TextTruncate     = Enum.TextTruncate.AtEnd,
+        ZIndex           = 3,
+    }, entry)
+
+    table.insert(State.logEntries, {frame=entry, remote=remote, index=logIndex})
+
+    -- Auto scroll
+    if State.autoScroll then
+        task.defer(function()
+            LogScroll.CanvasPosition = Vector2.new(0, LogScroll.AbsoluteCanvasSize.Y)
+        end)
+    end
+end
+
+-- ============================================================
+-- REMOTE ROW UI
+-- ============================================================
+local remoteRows = {} -- [remote] = frame
+
+function updateRemoteRow(remote)
+    local rd = State.remotes[remote]
+    if not rd or not remoteRows[remote] then return end
+    local row = remoteRows[remote]
+
+    -- Update count label
+    local countLbl = row:FindFirstChild("CountLabel")
+    if countLbl then
+        countLbl.Text = "×" .. rd.fireCount
+    end
+    -- Update last fired
+    local timeLbl = row:FindFirstChild("TimeLabel")
+    if timeLbl then
+        timeLbl.Text = rd.lastFired or "--:--:--"
+    end
+    -- Update block button color
+    local blockBtn = row:FindFirstChild("BlockBtn")
+    if blockBtn then
+        blockBtn.BackgroundColor3 = rd.blocked and THEME.DANGER or THEME.BG_ITEM_HOVER
+        blockBtn.Text = rd.blocked and "⛔" or "🔓"
+    end
+    -- Spy toggle color
+    local spyBtn = row:FindFirstChild("SpyBtn")
+    if spyBtn then
+        spyBtn.BackgroundColor3 = rd.spying and THEME.SUCCESS or THEME.BG_ITEM_HOVER
+    end
+end
+
+local function buildRemoteRow(remote)
+    if remoteRows[remote] then return end -- already built
+    local rd = State.remotes[remote]
+    local isEvent = (rd.remoteType == "RemoteEvent")
+    local accentColor = isEvent and THEME.LOG_EVENT or THEME.LOG_FUNC
+
+    local ROW_H = mobile and 70 or 60
+
+    local row = makeInstance("Frame", {
+        Name             = remote.Name,
+        Size             = UDim2.new(1, -8, 0, ROW_H),
+        BackgroundColor3 = THEME.BG_ITEM,
+        BorderSizePixel  = 0,
+        ZIndex           = 2,
+    }, RemoteScroll)
+    addCorner(row, 7)
+    remoteRows[remote] = row
+
+    -- Left type stripe
+    local stripe = makeInstance("Frame", {
+        Size             = UDim2.new(0, 3, 1, -8),
+        Position         = UDim2.new(0, 0, 0, 4),
+        BackgroundColor3 = accentColor,
+        BorderSizePixel  = 0,
+        ZIndex           = 3,
+    }, row)
+    addCorner(stripe, 2)
+
+    -- Type badge
+    local badge = makeInstance("TextLabel", {
+        Name             = "Badge",
+        Text             = isEvent and "EVT" or "FN",
+        TextColor3       = Color3.new(1,1,1),
+        BackgroundColor3 = accentColor,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 8,
+        Size             = UDim2.new(0, 28, 0, 14),
+        Position         = UDim2.new(0, 8, 0, 5),
+        BorderSizePixel  = 0,
+        ZIndex           = 4,
+    }, row)
+    addCorner(badge, 3)
+
+    -- Remote name
+    makeInstance("TextLabel", {
+        Name             = "NameLabel",
+        Text             = remote.Name,
+        TextColor3       = THEME.TEXT_PRIMARY,
+        BackgroundTransparency = 1,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 12,
+        Size             = UDim2.new(1, -120, 0, 16),
+        Position         = UDim2.new(0, 40, 0, 3),
+        TextXAlignment   = Enum.TextXAlignment.Left,
+        TextTruncate     = Enum.TextTruncate.AtEnd,
+        ZIndex           = 3,
+    }, row)
+
+    -- Fire count
+    makeInstance("TextLabel", {
+        Name             = "CountLabel",
+        Text             = "×0",
+        TextColor3       = THEME.TEXT_MUTED,
+        BackgroundTransparency = 1,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 10,
+        Size             = UDim2.new(0, 40, 0, 14),
+        Position         = UDim2.new(1, -45, 0, 3),
+        TextXAlignment   = Enum.TextXAlignment.Right,
+        ZIndex           = 3,
+    }, row)
+
+    -- Path label
+    makeInstance("TextLabel", {
+        Name             = "PathLabel",
+        Text             = getFullPath(remote),
+        TextColor3       = THEME.TEXT_MUTED,
+        BackgroundTransparency = 1,
+        Font             = Enum.Font.Code,
+        TextSize         = 9,
+        Size             = UDim2.new(1, -12, 0, 13),
+        Position         = UDim2.new(0, 8, 0, 20),
+        TextXAlignment   = Enum.TextXAlignment.Left,
+        TextTruncate     = Enum.TextTruncate.AtEnd,
+        ZIndex           = 3,
+    }, row)
+
+    -- Time label
+    makeInstance("TextLabel", {
+        Name             = "TimeLabel",
+        Text             = "--:--:--",
+        TextColor3       = THEME.TEXT_MUTED,
+        BackgroundTransparency = 1,
+        Font             = Enum.Font.Gotham,
+        TextSize         = 9,
+        Size             = UDim2.new(1, -12, 0, 12),
+        Position         = UDim2.new(0, 8, 0, 34),
+        TextXAlignment   = Enum.TextXAlignment.Left,
+        ZIndex           = 3,
+    }, row)
+
+    -- Buttons row
+    local BTN_Y = mobile and 50 or 44
+    local BTN_H = 18
+
+    -- Copy path button
+    local copyBtn = makeInstance("TextButton", {
+        Name             = "CopyBtn",
+        Text             = "📋 Copy",
+        TextColor3       = THEME.TEXT_PRIMARY,
+        BackgroundColor3 = THEME.BG_ITEM_HOVER,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 9,
+        AutoButtonColor  = false,
+        Size             = UDim2.new(0, 54, 0, BTN_H),
+        Position         = UDim2.new(0, 8, 0, BTN_Y),
+        BorderSizePixel  = 0,
+        ZIndex           = 4,
+    }, row)
+    addCorner(copyBtn, 4)
+
+    -- Fire button
+    local fireBtn = makeInstance("TextButton", {
+        Name             = "FireBtn",
+        Text             = "⚡ Fire",
+        TextColor3       = THEME.TEXT_PRIMARY,
+        BackgroundColor3 = THEME.ACCENT,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 9,
+        AutoButtonColor  = false,
+        Size             = UDim2.new(0, 50, 0, BTN_H),
+        Position         = UDim2.new(0, 66, 0, BTN_Y),
+        BorderSizePixel  = 0,
+        ZIndex           = 4,
+    }, row)
+    addCorner(fireBtn, 4)
+
+    -- Spy toggle button
+    local spyBtn = makeInstance("TextButton", {
+        Name             = "SpyBtn",
+        Text             = "👁 Spy",
+        TextColor3       = THEME.TEXT_PRIMARY,
+        BackgroundColor3 = THEME.BG_ITEM_HOVER,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 9,
+        AutoButtonColor  = false,
+        Size             = UDim2.new(0, 50, 0, BTN_H),
+        Position         = UDim2.new(0, 120, 0, BTN_Y),
+        BorderSizePixel  = 0,
+        ZIndex           = 4,
+    }, row)
+    addCorner(spyBtn, 4)
+
+    -- Block toggle button
+    local blockBtn = makeInstance("TextButton", {
+        Name             = "BlockBtn",
+        Text             = "🔓",
+        TextColor3       = THEME.TEXT_PRIMARY,
+        BackgroundColor3 = THEME.BG_ITEM_HOVER,
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 11,
+        AutoButtonColor  = false,
+        Size             = UDim2.new(0, 28, 0, BTN_H),
+        Position         = UDim2.new(0, 174, 0, BTN_Y),
+        BorderSizePixel  = 0,
+        ZIndex           = 4,
+    }, row)
+    addCorner(blockBtn, 4)
+
+    -- ---- Button Logic ----
+
+    -- Copy path
+    copyBtn.MouseButton1Click:Connect(function()
+        if setclipboard then
+            setclipboard(getFullPath(remote))
+        end
+        copyBtn.Text = "✓ Copied"
+        copyBtn.BackgroundColor3 = THEME.SUCCESS
+        task.delay(1.2, function()
+            if copyBtn and copyBtn.Parent then
+                copyBtn.Text = "📋 Copy"
+                copyBtn.BackgroundColor3 = THEME.BG_ITEM_HOVER
+            end
+        end)
+    end)
+
+    -- Fire / Invoke → open popup
+    fireBtn.MouseButton1Click:Connect(function()
+        activeFireTarget = remote
+        PopupTitle.Text = "Fire: " .. remote.Name
+        PopupArgBox.Text = ""
+        PopupResultLabel.Text = ""
+        FirePopup.Visible = true
+    end)
+
+    -- Spy toggle
+    spyBtn.MouseButton1Click:Connect(function()
+        rd.spying = not rd.spying
+        spyBtn.BackgroundColor3 = rd.spying and THEME.SUCCESS or THEME.BG_ITEM_HOVER
+        spyBtn.Text = rd.spying and "👁 ON" or "👁 Spy"
+    end)
+
+    -- Block toggle
+    blockBtn.MouseButton1Click:Connect(function()
+        rd.blocked = not rd.blocked
+        blockBtn.BackgroundColor3 = rd.blocked and THEME.DANGER or THEME.BG_ITEM_HOVER
+        blockBtn.Text = rd.blocked and "⛔" or "🔓"
+        if rd.blocked then
+            addLogEntry(remote, "BLOCKED", {})
+        else
+            addLogEntry(remote, "UNBLOCKED", {})
+        end
+    end)
+
+    -- Hover effect on row
+    row.MouseEnter:Connect(function()
+        TweenService:Create(row, TweenInfo.new(0.12), {BackgroundColor3 = THEME.BG_ITEM_HOVER}):Play()
+    end)
+    row.MouseLeave:Connect(function()
+        TweenService:Create(row, TweenInfo.new(0.12), {BackgroundColor3 = THEME.BG_ITEM}):Play()
+    end)
+
+    -- Listen for destruction
+    remote.AncestryChanged:Connect(function()
+        if not remote.Parent then
+            State.remotes[remote] = nil
+            remoteRows[remote] = nil
+            if row and row.Parent then row:Destroy() end
+            updateRemoteCount()
+        end
+    end)
+end
+
+function updateRemoteCount()
+    local count = 0
+    for _ in pairs(State.remotes) do count = count + 1 end
+    ListHeader.Text = string.format("REMOTES (%d)", count)
+end
+
+-- ============================================================
+-- REMOTE SCANNER
+-- ============================================================
+local function registerRemote(obj)
+    if State.remotes[obj] then return end -- already tracked
+    local isEvent = obj:IsA("RemoteEvent")
+    local isFunc  = obj:IsA("RemoteFunction")
+    if not (isEvent or isFunc) then return end
+
+    State.remotes[obj] = {
+        remoteType = isEvent and "RemoteEvent" or "RemoteFunction",
+        fireCount  = 0,
+        lastFired  = nil,
+        blocked    = false,
+        spying     = true,
+    }
+    buildRemoteRow(obj)
+    updateRemoteCount()
+end
+
+local function scanDescendants(root)
+    for _, obj in ipairs(root:GetDescendants()) do
+        pcall(registerRemote, obj)
+    end
+    root.DescendantAdded:Connect(function(obj)
+        task.defer(function() pcall(registerRemote, obj) end)
+    end)
+end
+
+local function fullScan()
+    -- Scan common locations
+    scanDescendants(ReplicatedStorage)
+    scanDescendants(game:GetService("Players"))
+    pcall(function() scanDescendants(game:GetService("Workspace")) end)
+    pcall(function() scanDescendants(game:GetService("ReplicatedFirst")) end)
+    pcall(function() scanDescendants(game:GetService("StarterGui")) end)
+    pcall(function() scanDescendants(game:GetService("Teams")) end)
+    pcall(function() scanDescendants(game:GetService("Chat")) end)
+    -- Try all top-level services
+    for _, child in ipairs(game:GetChildren()) do
+        pcall(scanDescendants, child)
+    end
+end
+
+-- ============================================================
+-- FILTER / SEARCH APPLY
+-- ============================================================
+local function applyFilters()
+    local q = State.searchQuery:lower()
+    for remote, rd in pairs(State.remotes) do
+        local row = remoteRows[remote]
+        if row then
+            local matchType = (State.filterType == "All")
+                or (State.filterType == "RemoteEvent" and rd.remoteType == "RemoteEvent")
+                or (State.filterType == "RemoteFunction" and rd.remoteType == "RemoteFunction")
+            local matchSearch = (q == "") or remote.Name:lower():find(q, 1, true)
+            row.Visible = matchType and (matchSearch ~= nil)
+        end
+    end
+end
+
+-- ============================================================
+-- POPUP FIRE LOGIC
+-- ============================================================
+local function fireActiveTarget()
+    if not activeFireTarget then return end
+    local remote = activeFireTarget
+    local rd = State.remotes[remote]
+    if not rd then return end
+
+    local argStr = PopupArgBox.Text
+    local args = parseArgs(argStr)
+
+    local ok, err = pcall(function()
+        if rd.remoteType == "RemoteEvent" then
+            remote:FireServer(table.unpack(args))
+        else
+            local result = remote:InvokeServer(table.unpack(args))
+            PopupResultLabel.TextColor3 = THEME.SUCCESS
+            PopupResultLabel.Text = "Return: " .. tostring(result):sub(1, 60)
+        end
+    end)
+
+    if ok then
+        if rd.remoteType == "RemoteEvent" then
+            PopupResultLabel.TextColor3 = THEME.SUCCESS
+            PopupResultLabel.Text = "✓ Fired successfully!"
+        end
+    else
+        PopupResultLabel.TextColor3 = THEME.DANGER
+        PopupResultLabel.Text = "✗ Error: " .. tostring(err):sub(1, 80)
+    end
+end
+
+PopupFireBtn.MouseButton1Click:Connect(fireActiveTarget)
+PopupArgBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then fireActiveTarget() end
+end)
+PopupClose.MouseButton1Click:Connect(function()
+    FirePopup.Visible = false
+    activeFireTarget = nil
+end)
+
+-- ============================================================
+-- TOOLBAR INTERACTIONS
+-- ============================================================
+SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    State.searchQuery = SearchBox.Text
+    applyFilters()
+end)
+
+local function setFilter(f, btn)
+    State.filterType = f
+    for _, b in ipairs({FilterAll, FilterEvents, FilterFuncs}) do
+        b.BackgroundColor3 = THEME.BG_ITEM
+        b.TextColor3 = THEME.TEXT_SECONDARY
+    end
+    btn.BackgroundColor3 = THEME.ACCENT
+    btn.TextColor3 = THEME.TEXT_PRIMARY
+    applyFilters()
+end
+setFilter("All", FilterAll) -- default
+
+FilterAll.MouseButton1Click:Connect(function() setFilter("All", FilterAll) end)
+FilterEvents.MouseButton1Click:Connect(function() setFilter("RemoteEvent", FilterEvents) end)
+FilterFuncs.MouseButton1Click:Connect(function() setFilter("RemoteFunction", FilterFuncs) end)
+
+RefreshBtn.MouseButton1Click:Connect(function()
+    RefreshBtn.Text = "⌛"
+    task.spawn(function()
+        fullScan()
+        task.wait(0.5)
+        RefreshBtn.Text = "↻"
+    end)
+end)
+
+ClearLogBtn.MouseButton1Click:Connect(function()
+    for _, entry in ipairs(State.logEntries) do
+        if entry.frame and entry.frame.Parent then
+            entry.frame:Destroy()
+        end
+    end
+    State.logEntries = {}
+    logIndex = 0
+end)
+
+AutoScrollBtn.MouseButton1Click:Connect(function()
+    State.autoScroll = not State.autoScroll
+    AutoScrollBtn.BackgroundColor3 = State.autoScroll and THEME.SUCCESS or THEME.BG_ITEM_HOVER
+    AutoScrollBtn.Text = State.autoScroll and "⬇" or "—"
+end)
+
+-- ============================================================
+-- TITLE BAR CONTROLS
+-- ============================================================
+CloseBtn.MouseButton1Click:Connect(function()
+    TweenService:Create(MainWindow, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+        Size = UDim2.new(0, WIN_W, 0, 0)
+    }):Play()
+    task.delay(0.25, function()
+        ScreenGui:Destroy()
+    end)
+end)
+
+MinMaxBtn.MouseButton1Click:Connect(function()
+    State.minimized = not State.minimized
+    local targetH = State.minimized and 40 or WIN_H
+    MinMaxBtn.Text = State.minimized and "□" or "–"
+    TweenService:Create(MainWindow, TweenInfo.new(0.2, Enum.EasingStyle.Quint), {
+        Size = UDim2.new(0, WIN_W, 0, targetH)
+    }):Play()
+    ContentFrame.Visible = not State.minimized
+end)
+
+SpyToggleBtn.MouseButton1Click:Connect(function()
+    State.spyEnabled = not State.spyEnabled
+    SpyToggleBtn.Text = State.spyEnabled and "ON" or "OFF"
+    SpyToggleBtn.BackgroundColor3 = State.spyEnabled and THEME.SUCCESS or THEME.DANGER
+end)
+
+-- ============================================================
+-- OPEN ANIMATION
+-- ============================================================
+MainWindow.Size = UDim2.new(0, WIN_W, 0, 0)
+TweenService:Create(MainWindow, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+    Size = UDim2.new(0, WIN_W, 0, WIN_H)
+}):Play()
+
+-- ============================================================
+-- INIT: HOOK + SCAN
+-- ============================================================
+task.spawn(function()
+    -- Install metatable hooks
+    pcall(hookRemoteMethods)
+    -- Full scan
+    fullScan()
+end)
+
+-- ============================================================
+-- PERFORMANCE GUARD: cap log entries at 500
+-- ============================================================
+RunService.Heartbeat:Connect(function()
+    if #State.logEntries > 500 then
+        local toRemove = State.logEntries[1]
+        if toRemove and toRemove.frame and toRemove.frame.Parent then
+            toRemove.frame:Destroy()
+        end
+        table.remove(State.logEntries, 1)
+    end
+end)
+
+print("[RemoteSpy Pro] Loaded successfully! Version: " .. VERSION)
